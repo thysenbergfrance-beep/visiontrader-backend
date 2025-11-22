@@ -1,8 +1,8 @@
 {
   "name": "visiontrader-backend",
   "version": "1.0.0",
-  "description": "Backend VisionTrader",
-  "main": "server.js",
+  "description": "Backend VisionTrader pour Render",
+  "main": "serveur.js",
   "scripts": {
     "start": "node server.js"
   },
