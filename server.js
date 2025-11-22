@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 
-// fetch universel
 let fetchFn = global.fetch;
 if (!fetchFn) {
   fetchFn = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
@@ -10,12 +9,29 @@ if (!fetchFn) {
 const app = express();
 app.use(cors());
 
-// =========================
-//     SAFE KLINE PARSER
-// =========================
+// Binance endpoints fallback (pour bypass restriction)
+const BINANCE_BASE = [
+  "https://api1.binance.com",
+  "https://api2.binance.com",
+  "https://api3.binance.com"
+];
+
+async function fetchKlines(symbol, interval) {
+  const params = `symbol=${symbol}&interval=${interval}&limit=200`;
+
+  for (const base of BINANCE_BASE) {
+    try {
+      const r = await fetchFn(`${base}/api/v3/klines?${params}`);
+      const json = await r.json();
+      if (Array.isArray(json)) return json;
+    } catch (e) {}
+  }
+
+  return null;
+}
+
 function safeMapKlines(data) {
   if (!Array.isArray(data)) return [];
-
   return data.map(r => ({
     opentime: r[0],
     open: +r[1],
@@ -26,54 +42,29 @@ function safeMapKlines(data) {
   }));
 }
 
-// =========================
-// MAIN API ENDPOINT
-// =========================
 app.get("/api/market", async (req, res) => {
   const symbol = req.query.symbol || "BTCUSDT";
 
-  const url1h = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=200`;
-  const url4h = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=4h&limit=200`;
-
   try {
-    const headers = {
-      "User-Agent": "Mozilla/5.0 VisionTraderBot",
-      "Accept": "application/json"
-    };
+    const k1h = await fetchKlines(symbol, "1h");
+    const k4h = await fetchKlines(symbol, "4h");
 
-    const [r1h, r4h] = await Promise.all([
-      fetchFn(url1h, { headers }),
-      fetchFn(url4h, { headers })
-    ]);
-
-    const json1h = await r1h.json();
-    const json4h = await r4h.json();
-
-    // 🔥 DEBUG BINANCE ERROR
-    if (!Array.isArray(json1h)) {
+    if (!k1h || !k4h) {
       return res.json({
         symbol,
-        error: "binance_1h_error",
-        details: json1h
-      });
-    }
-
-    if (!Array.isArray(json4h)) {
-      return res.json({
-        symbol,
-        error: "binance_4h_error",
-        details: json4h
+        error: "binance_blocked_or_unreachable",
+        details: "All fallback endpoints failed"
       });
     }
 
     res.json({
       symbol,
-      ohlcv_1h: safeMapKlines(json1h),
-      ohlcv_4h: safeMapKlines(json4h)
+      ohlcv_1h: safeMapKlines(k1h),
+      ohlcv_4h: safeMapKlines(k4h)
     });
 
   } catch (e) {
-    res.status(500).json({
+    res.json({
       error: "server_error",
       details: e.toString()
     });
