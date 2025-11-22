@@ -1,75 +1,115 @@
 const express = require("express");
 const cors = require("cors");
 
+// fetch universel (Node 18+ a déjà fetch, sinon node-fetch)
 let fetchFn = global.fetch;
 if (!fetchFn) {
-  fetchFn = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
+  fetchFn = (...args) =>
+    import("node-fetch").then(({ default: fetch }) => fetch(...args));
 }
 
 const app = express();
 app.use(cors());
 
-// Binance endpoints fallback (pour bypass restriction)
-const BINANCE_BASE = [
-  "https://api1.binance.com",
-  "https://api2.binance.com",
-  "https://api3.binance.com"
-];
+// ---------------------------
+//   UTILITAIRE SYMBOL -> OKX
+// ---------------------------
+// On accepte soit : BTCUSDT (style Binance)
+// soit : BTC-USDT (style OKX)
+// et on retourne un instId OKX du type "BTC-USDT"
+function toOkxInstId(symbolRaw) {
+  const s = (symbolRaw || "BTCUSDT").toUpperCase().trim();
 
-async function fetchKlines(symbol, interval) {
-  const params = `symbol=${symbol}&interval=${interval}&limit=200`;
+  // déjà au format OKX avec tiret
+  if (s.includes("-")) return s;
 
-  for (const base of BINANCE_BASE) {
-    try {
-      const r = await fetchFn(`${base}/api/v3/klines?${params}`);
-      const json = await r.json();
-      if (Array.isArray(json)) return json;
-    } catch (e) {}
+  // format classique BASEUSDT
+  const QUOTES = ["USDT", "USDC", "BTC", "ETH"];
+  for (const q of QUOTES) {
+    if (s.endsWith(q)) {
+      const base = s.slice(0, -q.length);
+      if (base.length > 0) {
+        return `${base}-${q}`;
+      }
+    }
   }
 
-  return null;
+  // fallback
+  return s;
 }
 
-function safeMapKlines(data) {
-  if (!Array.isArray(data)) return [];
-  return data.map(r => ({
-    opentime: r[0],
-    open: +r[1],
-    high: +r[2],
-    low: +r[3],
-    close: +r[4],
-    volume: +r[5]
+// ---------------------------
+//      FETCH CANDLES OKX
+// ---------------------------
+// OKX : GET /api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=200
+async function fetchOkxCandles(instId, bar) {
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(
+    instId
+  )}&bar=${encodeURIComponent(bar)}&limit=200`;
+
+  const res = await fetchFn(url, {
+    headers: {
+      "User-Agent": "VisionTraderBot/1.0",
+      Accept: "application/json",
+    },
+  });
+
+  const json = await res.json();
+
+  // OKX : code === "0" => OK
+  if (!json || json.code !== "0" || !Array.isArray(json.data)) {
+    throw new Error(
+      `OKX error for ${instId} ${bar}: ${JSON.stringify(json)}`
+    );
+  }
+
+  // json.data : array de [ts, o, h, l, c, vol, volCcy, volCcyQuote, ...]
+  // OKX renvoie les plus récentes en premier -> on reverse pour avoir du plus ancien au plus récent
+  const rows = [...json.data].reverse();
+
+  return rows.map((r) => ({
+    timestamp: Number(r[0]),
+    open: parseFloat(r[1]),
+    high: parseFloat(r[2]),
+    low: parseFloat(r[3]),
+    close: parseFloat(r[4]),
+    volume: parseFloat(r[5]),
   }));
 }
 
+// ---------------------------
+//       ENDPOINT PRINCIPAL
+// ---------------------------
 app.get("/api/market", async (req, res) => {
-  const symbol = req.query.symbol || "BTCUSDT";
-
   try {
-    const k1h = await fetchKlines(symbol, "1h");
-    const k4h = await fetchKlines(symbol, "4h");
+    const symbol = req.query.symbol || "BTCUSDT";
+    const instId = toOkxInstId(symbol); // ex : BTC-USDT
 
-    if (!k1h || !k4h) {
-      return res.json({
-        symbol,
-        error: "binance_blocked_or_unreachable",
-        details: "All fallback endpoints failed"
-      });
-    }
+    const [klines1h, klines4h] = await Promise.all([
+      fetchOkxCandles(instId, "1H"),
+      fetchOkxCandles(instId, "4H"),
+    ]);
 
     res.json({
-      symbol,
-      ohlcv_1h: safeMapKlines(k1h),
-      ohlcv_4h: safeMapKlines(k4h)
+      provider: "okx",
+      symbol: symbol.toUpperCase(),
+      instId,
+      ohlcv_1h: klines1h,
+      ohlcv_4h: klines4h,
     });
-
   } catch (e) {
-    res.json({
+    console.error("VisionTrader OKX backend error:", e);
+    res.status(500).json({
       error: "server_error",
-      details: e.toString()
+      details: e.toString(),
     });
   }
 });
 
+// ---------------------------
+//       LANCEMENT SERVEUR
+// ---------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("VisionTrader backend ONLINE on port", PORT));
+app.listen(PORT, () => {
+  console.log("VisionTrader OKX backend ONLINE on port", PORT);
+});
